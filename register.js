@@ -1,15 +1,21 @@
 // register.js
 import 'dotenv/config';
-import { REST, Routes } from '@discordjs/rest';
 import {
+  REST,
+  Routes,
   SlashCommandBuilder,
   PermissionFlagsBits,
 } from 'discord.js';
 
-const { DISCORD_TOKEN, APPLICATION_ID, GUILD_ID } = process.env;
+const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
 
-if (!DISCORD_TOKEN || !APPLICATION_ID || !GUILD_ID) {
-  console.error('Missing DISCORD_TOKEN / APPLICATION_ID / GUILD_ID in .env');
+if (!DISCORD_TOKEN || !CLIENT_ID || !GUILD_ID) {
+  console.error('❌ Missing DISCORD_TOKEN / CLIENT_ID / GUILD_ID in .env');
+  console.log({
+    hasToken: !!DISCORD_TOKEN,
+    CLIENT_ID,
+    GUILD_ID,
+  });
   process.exit(1);
 }
 
@@ -26,9 +32,7 @@ const commands = [
     .setName('nfl')
     .setDescription('Latest NFL headlines from default sources (or a specific source)')
     .addIntegerOption(o =>
-      o.setName('count')
-       .setDescription('How many (1–5)')
-       .setMinValue(1).setMaxValue(5)
+      o.setName('count').setDescription('How many (1–5)').setMinValue(1).setMaxValue(5)
     )
     .addStringOption(o =>
       o.setName('source')
@@ -36,7 +40,6 @@ const commands = [
        .addChoices(...SOURCE_CHOICES.map(([name, value]) => ({ name, value })))
     ),
 
-  // Admin-only by default (ManageGuild required)
   new SlashCommandBuilder()
     .setName('subscribe')
     .setDescription('Subscribe this channel to default NFL headlines')
@@ -51,18 +54,12 @@ const commands = [
     .setName('team')
     .setDescription('Latest headlines for a specific NFL team')
     .addStringOption(o =>
-      o.setName('team')
-       .setDescription('Team name (autocomplete)')
-       .setRequired(true)
-       .setAutocomplete(true)
+      o.setName('team').setDescription('Team name (autocomplete)').setRequired(true).setAutocomplete(true)
     )
     .addIntegerOption(o =>
-      o.setName('count')
-       .setDescription('How many (1–5)')
-       .setMinValue(1).setMaxValue(5)
+      o.setName('count').setDescription('How many (1–5)').setMinValue(1).setMaxValue(5)
     ),
 
-  // New: quick fantasy + injuries
   new SlashCommandBuilder()
     .setName('fantasynews')
     .setDescription('Latest NFL fantasy player news (RotoWire)')
@@ -77,7 +74,6 @@ const commands = [
       o.setName('count').setDescription('How many (1–5)').setMinValue(1).setMaxValue(5)
     ),
 
-  // New: bot health/status
   new SlashCommandBuilder()
     .setName('status')
     .setDescription('Bot heartbeat, next tick ETA, feed counts, last error'),
@@ -85,8 +81,9 @@ const commands = [
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
+// ✅ Guild-scoped registration (near-instant in the server)
 await rest.put(
-  Routes.applicationGuildCommands(APPLICATION_ID, GUILD_ID),
+  Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
   { body: commands },
 );
 
