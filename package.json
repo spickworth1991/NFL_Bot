@@ -7,6 +7,7 @@
     "start": "node index.js",
     "register": "node register.js"
   },
+  "engines": { "node": "20.x" },
   "keywords": [],
   "author": "",
   "license": "ISC",

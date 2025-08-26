@@ -1,29 +1,41 @@
-// index.js
 import 'dotenv/config';
 import crypto from 'node:crypto';
-import { Client, GatewayIntentBits } from 'discord.js';
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  EmbedBuilder,
+  GatewayIntentBits,
+  PermissionFlagsBits,
+} from 'discord.js';
 import RSSParser from 'rss-parser';
 import Database from 'better-sqlite3';
 
-const { DISCORD_TOKEN, FEEDS = '', POLL_SECONDS = '90' } = process.env;
+// ===== ENV =====
+const {
+  DISCORD_TOKEN,
+  FEEDS = '',
+  POLL_SECONDS = '90',
+} = process.env;
 
-// ===== CRITICAL GUARDS =====
 if (!DISCORD_TOKEN) {
   console.error('❌ Missing DISCORD_TOKEN in .env (project root).');
   process.exit(1);
 }
+
+// ===== GLOBALS / SAFETY =====
 process.on('unhandledRejection', (err) => console.error('UNHANDLED REJECTION:', err));
 process.on('uncaughtException', (err) => console.error('UNCAUGHT EXCEPTION:', err));
-// ===== END GUARDS =====
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 client.on('error', (e) => console.error('CLIENT ERROR:', e));
 client.on('shardError', (e) => console.error('SHARD ERROR:', e));
 
-const parser = new RSSParser();
+const parser = new RSSParser({ timeout: 10000 });
 const db = new Database('state.db');
 
-// --- DB schema ---
+// ===== DB =====
 db.prepare(`CREATE TABLE IF NOT EXISTS subscriptions (channel_id TEXT PRIMARY KEY)`).run();
 db.prepare(`CREATE TABLE IF NOT EXISTS channel_feeds (channel_id TEXT, feed TEXT, PRIMARY KEY (channel_id, feed))`).run();
 db.prepare(`CREATE TABLE IF NOT EXISTS seen (feed TEXT, linkhash TEXT, PRIMARY KEY (feed, linkhash))`).run();
@@ -36,12 +48,138 @@ const feedsFor = db.prepare('SELECT feed FROM channel_feeds WHERE channel_id = ?
 const hasSeen = db.prepare('SELECT 1 FROM seen WHERE feed = ? AND linkhash = ?');
 const markSeen = db.prepare('INSERT OR IGNORE INTO seen (feed, linkhash) VALUES (?, ?)');
 
-// --- Defaults for league-wide headlines (/nfl and subscriptions) ---
+// ===== FEEDS & HELPERS =====
 const defaultFeeds = FEEDS.split(',').map(s => s.trim()).filter(Boolean);
 
-// --- Team directories (codes, labels, feeds) ---
-// SB Nation team blogs expose RSS at /rss/index.xml (e.g., Arrowhead Pride, Pride of Detroit).
-// Official fallbacks where available: 49ers + Packers.
+// Known, reliable sources you can request via /nfl source=
+const FEED_MAP = {
+  espn:     'https://www.espn.com/espn/rss/nfl/news',
+  cbs:      'https://www.cbssports.com/rss/headlines/nfl',
+  rotowire: 'https://www.rotowire.com/rss/news.php?sport=NFL',
+};
+
+const INJURY_REGEX = /\b(acl|mcl|achilles|hamstring|concussion|pcl|meniscus|groin|ankle|foot|hand|shoulder|back|neck|hip|rib|oblique|sprain|strain|pup|nfi|doubtful|questionable|out|ir|injur|designated to return|placed on (ir|injured reserve))\b/i;
+
+const sha1 = (s) => crypto.createHash('sha1').update(String(s || '')).digest('hex');
+
+async function fetchFeed(url) {
+  try {
+    const feed = await parser.parseURL(url);
+    return feed;
+  } catch (e) {
+    console.error('Feed error:', url, e.message);
+    return { items: [] };
+  }
+}
+
+function uniqueNewest(items, limit) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items.sort((a,b) =>
+    new Date(b.pubDate || b.isoDate || 0) - new Date(a.pubDate || a.isoDate || 0))) {
+    const key = (it.link || it.guid || it.id || it.title || '').trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+async function getFresh(feedUrl, limit = 2) {
+  const feed = await fetchFeed(feedUrl);
+  const items = (feed.items || []).sort((a, b) =>
+    new Date(b.pubDate || b.isoDate || 0) - new Date(a.pubDate || a.isoDate || 0)
+  );
+  const fresh = [];
+  for (const it of items) {
+    const link = it.link || it.guid || it.id || '';
+    if (!link) continue;
+    const key = sha1(link);
+    if (!hasSeen.get(feedUrl, key)) {
+      fresh.push(it);
+      markSeen.run(feedUrl, key);
+    }
+  }
+  return fresh.slice(0, limit);
+}
+
+// ===== Buttons row (always appended) =====
+function linkButtonsRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel('ESPN NFL').setStyle(ButtonStyle.Link).setURL('https://www.espn.com/nfl/'),
+    new ButtonBuilder().setLabel('CBS NFL').setStyle(ButtonStyle.Link).setURL('https://www.cbssports.com/nfl/'),
+    new ButtonBuilder().setLabel('PFT').setStyle(ButtonStyle.Link).setURL('https://www.nbcsports.com/nfl/profootballtalk'),
+    new ButtonBuilder().setLabel('Yahoo NFL').setStyle(ButtonStyle.Link).setURL('https://sports.yahoo.com/nfl/'),
+    new ButtonBuilder().setLabel('FOX NFL').setStyle(ButtonStyle.Link).setURL('https://www.foxsports.com/nfl')
+  );
+}
+function linkButtonsRow2() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setLabel('Guardian NFL').setStyle(ButtonStyle.Link).setURL('https://www.theguardian.com/sport/nfl'),
+    new ButtonBuilder().setLabel('PFF').setStyle(ButtonStyle.Link).setURL('https://www.pff.com/news'),
+    new ButtonBuilder().setLabel('RotoWire NFL').setStyle(ButtonStyle.Link).setURL('https://www.rotowire.com/football/')
+  );
+}
+
+// ===== Scheduler / Status =====
+let intervalMs = Math.max(20, Number(POLL_SECONDS)) * 1000;
+let nextTickAt = null;
+let lastError = null;
+
+async function tick() {
+  // Broadcast new items to all subscribed channels
+  for (const { channel_id } of allSubs()) {
+    const channel = await client.channels.fetch(channel_id).catch(() => null);
+    if (!channel) continue;
+    const rows = feedsFor.all(channel_id);
+    const feeds = rows.length ? rows.map(r => r.feed) : defaultFeeds;
+
+    for (const url of feeds) {
+      const fresh = await getFresh(url, 2);
+      for (const n of fresh) {
+        const title = (n.title || '').trim();
+        const link  = (n.link  || '').trim();
+        if (!title || !link) continue;
+
+        const src = url.includes('espn.com') ? 'ESPN'
+          : url.includes('cbssports.com') ? 'CBS'
+          : url.includes('rotowire.com') ? 'RotoWire'
+          : 'Source';
+
+        await channel.send({
+          content: `**${title}** — ${link}\n_${src}_`,
+          components: [linkButtonsRow(), linkButtonsRow2()],
+        });
+        await new Promise(r => setTimeout(r, 650));
+      }
+    }
+  }
+}
+
+async function runTick() {
+  try {
+    await tick();
+    lastError = null;
+  } catch (e) {
+    console.error('tick() error:', e);
+    lastError = String(e?.stack || e?.message || e);
+  } finally {
+    nextTickAt = new Date(Date.now() + intervalMs);
+  }
+}
+
+function etaStr(date) {
+  if (!date) return '—';
+  const ms = date - Date.now();
+  if (ms <= 0) return 'imminent';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), rs = s % 60;
+  return `${m}m ${rs}s`;
+}
+
+// ===== TEAM MAPS (autocomplete uses labels; /team expects code) =====
 const TEAM_LABELS = {
   ARI: 'Arizona Cardinals', ATL: 'Atlanta Falcons', BAL: 'Baltimore Ravens', BUF: 'Buffalo Bills',
   CAR: 'Carolina Panthers', CHI: 'Chicago Bears',   CIN: 'Cincinnati Bengals', CLE: 'Cleveland Browns',
@@ -52,7 +190,7 @@ const TEAM_LABELS = {
   NYJ: 'New York Jets',     PHI: 'Philadelphia Eagles',  PIT: 'Pittsburgh Steelers', SEA: 'Seattle Seahawks',
   SF:  'San Francisco 49ers', TB: 'Tampa Bay Buccaneers', TEN: 'Tennessee Titans',  WAS: 'Washington Commanders',
 };
-
+// (Keep whatever team feed mapping you’ve been using; shown here with a few examples & safe fallbacks)
 const TEAM_FEEDS = {
   ARI: ['https://www.revengeofthebirds.com/rss/index.xml'],
   ATL: ['https://www.thefalcoholic.com/rss/index.xml'],
@@ -88,146 +226,170 @@ const TEAM_FEEDS = {
   WAS: ['https://www.hogshaven.com/rss/index.xml'],
 };
 
-// --- Utils ---
-const sha1 = (s) => crypto.createHash('sha1').update(String(s || '')).digest('hex');
-
-async function fetchFeed(url) {
-  try {
-    return await parser.parseURL(url);
-  } catch (e) {
-    console.error('Feed error:', url, e.message);
-    return { items: [] };
-  }
-}
-
-async function getFresh(feedUrl, limit = 2) {
-  const feed = await fetchFeed(feedUrl);
-  const items = (feed.items || []).sort(
-    (a, b) => new Date(b.pubDate || b.isoDate || 0) - new Date(a.pubDate || a.isoDate || 0)
-  );
-  const fresh = [];
-  for (const it of items) {
-    const link = it.link || it.guid || it.id || '';
-    if (!link) continue;
-    const key = sha1(link);
-    if (!hasSeen.get(feedUrl, key)) {
-      fresh.push(it);
-      markSeen.run(feedUrl, key);
-    }
-  }
-  return fresh.slice(0, limit);
-}
-
-// Aggregate across multiple feeds (used by /team)
-async function getFromFeeds(urls = [], limit = 5) {
-  const all = [];
-  for (const url of urls) {
-    const f = await fetchFeed(url);
-    all.push(...(f.items || []));
-  }
-  all.sort((a, b) => new Date(b.pubDate || b.isoDate || 0) - new Date(a.pubDate || a.isoDate || 0));
-  const seen = new Set(), out = [];
-  for (const it of all) {
-    const k = (it.link || it.title || '').trim();
-    if (!k || seen.has(k)) continue;
-    seen.add(k); out.push(it);
-    if (out.length >= limit) break;
-  }
-  return out;
-}
-
-// --- background ticker for subscribed channels ---
-async function tick() {
-  for (const { channel_id } of allSubs()) {
-    const channel = await client.channels.fetch(channel_id).catch(() => null);
-    if (!channel) continue;
-    const rows = feedsFor.all(channel_id);
-    const feeds = rows.length ? rows.map(r => r.feed) : defaultFeeds;
-
-    for (const url of feeds) {
-      const fresh = await getFresh(url, 2);
-      for (const n of fresh) {
-        const title = (n.title || '').trim();
-        const link  = (n.link  || '').trim();
-        if (!title || !link) continue;
-        const src = url.includes('espn.com') ? 'ESPN' :
-                    url.includes('nbcsports.com') ? 'ProFootballTalk' : 'Source';
-        await channel.send(`**${title}** — ${link}\n_${src}_`);
-        await new Promise(r => setTimeout(r, 700));
-      }
-    }
-  }
-}
-
-// --- lifecycle ---
+// ===== READY =====
 client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  setInterval(tick, Math.max(20, Number(POLL_SECONDS)) * 1000);
+  nextTickAt = new Date(Date.now() + intervalMs);
+  // Kick off immediately, then interval
+  runTick();
+  setInterval(runTick, intervalMs);
 });
 
-// --- interactions (autocomplete + commands) ---
+// ===== INTERACTIONS =====
 client.on('interactionCreate', async (i) => {
   try {
-    // Autocomplete for /team team:<value>
-    if (i.isAutocomplete() && i.commandName === 'team') {
-      const q = (i.options.getFocused() || '').toLowerCase();
+    // ===== AUTOCOMPLETE for /team =====
+    if (i.isAutocomplete()) {
+      const focused = i.options.getFocused()?.toLowerCase() || '';
       const entries = Object.entries(TEAM_LABELS)
         .map(([code, label]) => ({ code, label }))
-        .filter(({ code, label }) => !q || code.toLowerCase().includes(q) || label.toLowerCase().includes(q))
-        .slice(0, 25); // Discord hard cap
+        .filter(x => x.label.toLowerCase().includes(focused) || x.code.toLowerCase().includes(focused))
+        .slice(0, 25); // API hard cap
       return i.respond(entries.map(e => ({ name: e.label, value: e.code })));
     }
 
     if (!i.isChatInputCommand()) return;
 
+    // ===== /nfl =====
     if (i.commandName === 'nfl') {
       await i.deferReply();
       const count = Math.min(5, Math.max(1, i.options.getInteger('count') ?? 3));
+      const sourceKey = (i.options.getString('source') || 'all').toLowerCase();
+
+      let feedUrls = [];
+      if (sourceKey === 'all') {
+        feedUrls = defaultFeeds.length ? defaultFeeds : Object.values(FEED_MAP);
+      } else if (FEED_MAP[sourceKey]) {
+        feedUrls = [FEED_MAP[sourceKey]];
+      } else {
+        // allow user to pass a literal URL in future; for now ignore unknown
+        feedUrls = defaultFeeds.length ? defaultFeeds : Object.values(FEED_MAP);
+      }
+
       const all = [];
-      for (const url of defaultFeeds) {
+      for (const url of feedUrls) {
         const f = await fetchFeed(url);
         all.push(...(f.items || []));
       }
-      all.sort((a, b) => new Date(b.pubDate || 0) - new Date(a.pubDate || 0));
-      const seen = new Set(), out = [];
-      for (const it of all) {
-        const k = (it.link || it.title || '').trim();
-        if (!k || seen.has(k)) continue;
-        seen.add(k); out.push(it);
-        if (out.length >= count) break;
-      }
-      return i.editReply(out.length
+      const out = uniqueNewest(all, count);
+
+      const text = out.length
         ? out.map(n => `• **${(n.title||'').trim()}** — ${n.link}`).join('\n')
-        : 'No headlines right now.');
+        : 'No headlines right now.';
+
+      return i.editReply({
+        content: text,
+        components: [linkButtonsRow(), linkButtonsRow2()],
+      });
     }
 
+    // ===== /subscribe (admin only by default; double-guard here too) =====
     if (i.commandName === 'subscribe') {
+      if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        return i.reply({ content: '⛔ Requires **Manage Server**.', ephemeral: true });
+      }
       addSub.run(i.channelId);
-      for (const f of defaultFeeds) addFeed.run(i.channelId, f);
-      return i.reply({ content: `✅ Subscribed. Polling every ${POLL_SECONDS}s.`, ephemeral: true });
+      // seed channel with whatever default feeds are configured
+      for (const f of (defaultFeeds.length ? defaultFeeds : Object.values(FEED_MAP))) {
+        addFeed.run(i.channelId, f);
+      }
+      return i.reply({
+        content: `✅ Subscribed. Polling every ${Math.round(intervalMs/1000)}s.`,
+        ephemeral: true,
+      });
     }
 
+    // ===== /unsubscribe (admin only by default; double-guard here too) =====
     if (i.commandName === 'unsubscribe') {
+      if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        return i.reply({ content: '⛔ Requires **Manage Server**.', ephemeral: true });
+      }
       delSub.run(i.channelId);
       return i.reply({ content: '✅ Unsubscribed.', ephemeral: true });
     }
 
+    // ===== /team (on-demand; not in the subscription firehose) =====
     if (i.commandName === 'team') {
-      const code = i.options.getString('team', true); // e.g., 'DET'
-      const feeds = TEAM_FEEDS[code];
+      const code = i.options.getString('team', true);
+      const url = TEAM_FEEDS[code];
       const count = Math.min(5, Math.max(1, i.options.getInteger('count') ?? 3));
-      if (!feeds) return i.reply({ content: 'Unknown team code.', ephemeral: true });
+      if (!url) return i.reply({ content: 'Unknown team.', ephemeral: true });
 
       await i.deferReply();
-      const posts = await getFromFeeds(feeds, count);
-      return i.editReply(posts.length
-        ? posts.map(n => `• **${(n.title||'').trim()}** — ${n.link}`).join('\n')
-        : 'No team headlines right now.');
+      const f = await fetchFeed(url);
+      const items = uniqueNewest(f.items || [], count);
+      const text = items.length
+        ? items.map(n => `• **${(n.title||'').trim()}** — ${n.link}`).join('\n')
+        : 'No team headlines right now.';
+      return i.editReply({
+        content: text,
+        components: [linkButtonsRow(), linkButtonsRow2()],
+      });
+    }
+
+    // ===== /fantasynews (RotoWire) =====
+    if (i.commandName === 'fantasynews') {
+      await i.deferReply({ ephemeral: false });
+      const count = Math.min(5, Math.max(1, i.options.getInteger('count') ?? 3));
+      const f = await fetchFeed(FEED_MAP.rotowire);
+      const items = uniqueNewest(f.items || [], count);
+      const text = items.length
+        ? items.map(n => `• **${(n.title||'').trim()}** — ${n.link}`).join('\n')
+        : 'No fantasy headlines right now.';
+      return i.editReply({
+        content: text,
+        components: [linkButtonsRow(), linkButtonsRow2()],
+      });
+    }
+
+    // ===== /injuries (filter from RotoWire feed) =====
+    if (i.commandName === 'injuries') {
+      await i.deferReply();
+      const count = Math.min(5, Math.max(1, i.options.getInteger('count') ?? 3));
+      const f = await fetchFeed(FEED_MAP.rotowire);
+      const items = (f.items || [])
+        .filter(n =>
+          INJURY_REGEX.test(n.title || '') ||
+          INJURY_REGEX.test(n.contentSnippet || '') ||
+          INJURY_REGEX.test(n.content || '')
+        );
+      const out = uniqueNewest(items, count);
+      const text = out.length
+        ? out.map(n => `• **${(n.title||'').trim()}** — ${n.link}`).join('\n')
+        : 'No injury headlines right now.';
+      return i.editReply({
+        content: text,
+        components: [linkButtonsRow(), linkButtonsRow2()],
+      });
+    }
+
+    // ===== /status =====
+    if (i.commandName === 'status') {
+      const subCount = allSubs().length;
+      const feedCount = defaultFeeds.length ? defaultFeeds.length : Object.keys(FEED_MAP).length;
+
+      const embed = new EmbedBuilder()
+        .setTitle('NFL Bot Status')
+        .setColor(0x2ecc71)
+        .addFields(
+          { name: 'Next Tick', value: nextTickAt ? `${nextTickAt.toLocaleString()} (~${etaStr(nextTickAt)})` : '—', inline: false },
+          { name: 'Interval', value: `${Math.round(intervalMs/1000)}s`, inline: true },
+          { name: 'Subscribed Channels', value: String(subCount), inline: true },
+          { name: 'Default Feed Count', value: String(feedCount), inline: true },
+          { name: 'Last Error', value: lastError ? `\`\`\`\n${String(lastError).slice(0, 500)}\n\`\`\`` : 'None', inline: false },
+        )
+        .setTimestamp(new Date());
+
+      return i.reply({
+        embeds: [embed],
+        components: [linkButtonsRow(), linkButtonsRow2()],
+        ephemeral: true, // only the admin who runs it sees it
+      });
     }
   } catch (err) {
-    console.error('CLIENT ERROR:', err);
+    console.error('INTERACTION ERROR:', err);
     if (i.isRepliable()) {
-      try { await i.reply({ content: 'Something went wrong handling that command.', ephemeral: true }); } catch {}
+      try { await i.reply({ content: '⚠️ Something went wrong handling that command.', ephemeral: true }); } catch {}
     }
   }
 });
