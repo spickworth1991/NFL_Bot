@@ -32,7 +32,14 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 client.on('error', (e) => console.error('CLIENT ERROR:', e));
 client.on('shardError', (e) => console.error('SHARD ERROR:', e));
 
-const parser = new RSSParser({ timeout: 10000 });
+const parser = new RSSParser({
+  timeout: 10000,
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) DiscordNFLBot/1.0',
+    'Accept': 'application/rss+xml, application/xml;q=0.9, */*;q=0.8',
+  },
+});
+
 const db = new Database('state.db');
 
 // ===== DB =====
@@ -57,6 +64,16 @@ const FEED_MAP = {
   cbs:      'https://www.cbssports.com/rss/headlines/nfl',
   rotowire: 'https://www.rotowire.com/rss/news.php?sport=NFL',
 };
+
+async function fetchManyFeeds(urls = []) {
+  const all = [];
+  for (const url of urls) {
+    const feed = await fetchFeed(url);
+    if (Array.isArray(feed.items)) all.push(...feed.items);
+  }
+  return all;
+}
+
 
 const INJURY_REGEX = /\b(acl|mcl|achilles|hamstring|concussion|pcl|meniscus|groin|ankle|foot|hand|shoulder|back|neck|hip|rib|oblique|sprain|strain|pup|nfi|doubtful|questionable|out|ir|injur|designated to return|placed on (ir|injured reserve))\b/i;
 
@@ -310,22 +327,33 @@ client.on('interactionCreate', async (i) => {
 
     // ===== /team (on-demand; not in the subscription firehose) =====
     if (i.commandName === 'team') {
-      const code = i.options.getString('team', true);
-      const url = TEAM_FEEDS[code];
-      const count = Math.min(5, Math.max(1, i.options.getInteger('count') ?? 3));
-      if (!url) return i.reply({ content: 'Unknown team.', ephemeral: true });
+    const code = i.options.getString('team', true);
+    const sources = TEAM_FEEDS[code];
+    const count = Math.min(5, Math.max(1, i.options.getInteger('count') ?? 3));
 
-      await i.deferReply();
-      const f = await fetchFeed(url);
-      const items = uniqueNewest(f.items || [], count);
-      const text = items.length
-        ? items.map(n => `• **${(n.title||'').trim()}** — ${n.link}`).join('\n')
+    if (!sources) {
+        return i.reply({ content: 'Unknown team.', ephemeral: true });
+    }
+
+    await i.deferReply();
+
+    const feedList = Array.isArray(sources) ? sources : [sources];
+    // optional: quick debug so you can see what each feed returns
+    // console.log('TEAM', code, 'feeds:', feedList);
+
+    const allItems = await fetchManyFeeds(feedList);
+    const items = uniqueNewest(allItems, count);
+
+    const text = items.length
+        ? items.map(n => `• **${(n.title || '').trim()}** — ${n.link}`).join('\n')
         : 'No team headlines right now.';
-      return i.editReply({
+
+    return i.editReply({
         content: text,
         components: [linkButtonsRow(), linkButtonsRow2()],
-      });
+    });
     }
+
 
     // ===== /fantasynews (RotoWire) =====
     if (i.commandName === 'fantasynews') {
