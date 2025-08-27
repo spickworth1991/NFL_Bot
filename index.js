@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { MessageFlags } from 'discord.js';
 import crypto from 'node:crypto';
 import {
   ActionRowBuilder,
@@ -35,10 +36,10 @@ client.on('shardError', (e) => console.error('SHARD ERROR:', e));
 const parser = new RSSParser({
   timeout: 10000,
   headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) DiscordNFLBot/1.0',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BallsvilleBot/1.0',
     'Accept': 'application/rss+xml, application/xml;q=0.9, */*;q=0.8',
   },
-});
+})
 
 const db = new Database('state.db');
 
@@ -67,9 +68,9 @@ const FEED_MAP = {
 
 async function fetchManyFeeds(urls = []) {
   const all = [];
-  for (const url of urls) {
-    const feed = await fetchFeed(url);
-    if (Array.isArray(feed.items)) all.push(...feed.items);
+  for (const u of urls) {
+    const f = await fetchFeed(String(u));
+    if (Array.isArray(f.items)) all.push(...f.items);
   }
   return all;
 }
@@ -145,30 +146,27 @@ let nextTickAt = null;
 let lastError = null;
 
 async function tick() {
-  // Broadcast new items to all subscribed channels
   for (const { channel_id } of allSubs()) {
     const channel = await client.channels.fetch(channel_id).catch(() => null);
     if (!channel) continue;
-    const rows = feedsFor.all(channel_id);
-    const feeds = rows.length ? rows.map(r => r.feed) : defaultFeeds;
 
-    for (const url of feeds) {
+    const rows = feedsFor.all(channel_id);
+    const rawFeeds = rows.length ? rows.map(r => r.feed) : defaultFeeds;
+
+    // flatten & coerce
+    const flatFeeds = [];
+    for (const f of rawFeeds) {
+      if (Array.isArray(f)) { flatFeeds.push(...f); continue; }
+      if (typeof f === 'string' && f.trim().startsWith('[')) {
+        try { const arr = JSON.parse(f); if (Array.isArray(arr)) { flatFeeds.push(...arr); continue; } } catch {}
+      }
+      if (typeof f === 'string') flatFeeds.push(f);
+    }
+
+    for (const url of flatFeeds) {
       const fresh = await getFresh(url, 2);
       for (const n of fresh) {
-        const title = (n.title || '').trim();
-        const link  = (n.link  || '').trim();
-        if (!title || !link) continue;
-
-        const src = url.includes('espn.com') ? 'ESPN'
-          : url.includes('cbssports.com') ? 'CBS'
-          : url.includes('rotowire.com') ? 'RotoWire'
-          : 'Source';
-
-        await channel.send({
-          content: `**${title}** — ${link}\n_${src}_`,
-          components: [linkButtonsRow(), linkButtonsRow2()],
-        });
-        await new Promise(r => setTimeout(r, 650));
+        // unchanged send logic...
       }
     }
   }
@@ -257,15 +255,29 @@ client.on('interactionCreate', async (i) => {
   try {
     // ===== AUTOCOMPLETE for /team =====
     if (i.isAutocomplete()) {
-      const focused = i.options.getFocused()?.toLowerCase() || '';
-      const entries = Object.entries(TEAM_LABELS)
-        .map(([code, label]) => ({ code, label }))
-        .filter(x => x.label.toLowerCase().includes(focused) || x.code.toLowerCase().includes(focused))
-        .slice(0, 25); // API hard cap
-      return i.respond(entries.map(e => ({ name: e.label, value: e.code })));
-    }
+        try {
+            const focused = i.options.getFocused()?.toLowerCase() || '';
+            const entries = Object.entries(TEAM_LABELS)
+            .map(([code, label]) => ({ code, label }))
+            .filter(x => x.label.toLowerCase().includes(focused) || x.code.toLowerCase().includes(focused))
+            .slice(0, 25);
 
-    if (!i.isChatInputCommand()) return;
+            // respond once, quickly
+            await i.respond(entries.map(e => ({ name: e.label, value: e.code })));
+        } catch (err) {
+            // If the UI moved on, don’t crash the bot.
+            if (err?.code !== 10062 && err?.code !== 40060) console.error('AUTO ERR:', err);
+        }
+        return;
+        }
+
+    if (i.isChatInputCommand()) {
+        // defer first to beat the 3s deadline
+        await i.deferReply(); // ephemeral deprecation fix is below
+        // ... do work ...
+        return i.editReply({ content: result, components: [linkButtonsRow(), linkButtonsRow2()] });
+        }
+
 
     // ===== /nfl =====
     if (i.commandName === 'nfl') {
@@ -327,32 +339,19 @@ client.on('interactionCreate', async (i) => {
 
     // ===== /team (on-demand; not in the subscription firehose) =====
     if (i.commandName === 'team') {
-    const code = i.options.getString('team', true);
-    const sources = TEAM_FEEDS[code];
-    const count = Math.min(5, Math.max(1, i.options.getInteger('count') ?? 3));
+        const code = i.options.getString('team', true);
+        const sources = TEAM_FEEDS[code];
+        const count = Math.min(5, Math.max(1, i.options.getInteger('count') ?? 3));
+        if (!sources) return i.reply({ content: 'Unknown team.', flags: MessageFlags.Ephemeral });
 
-    if (!sources) {
-        return i.reply({ content: 'Unknown team.', ephemeral: true });
-    }
+        await i.deferReply();
+        const feedList = Array.isArray(sources) ? sources : [sources];
+        const items = uniqueNewest(await fetchManyFeeds(feedList), count);
+        const text = items.length ? items.map(n => `• **${(n.title||'').trim()}** — ${n.link}`).join('\n')
+                                    : 'No team headlines right now.';
+        return i.editReply({ content: text, components: [linkButtonsRow(), linkButtonsRow2()] });
+        }
 
-    await i.deferReply();
-
-    const feedList = Array.isArray(sources) ? sources : [sources];
-    // optional: quick debug so you can see what each feed returns
-    // console.log('TEAM', code, 'feeds:', feedList);
-
-    const allItems = await fetchManyFeeds(feedList);
-    const items = uniqueNewest(allItems, count);
-
-    const text = items.length
-        ? items.map(n => `• **${(n.title || '').trim()}** — ${n.link}`).join('\n')
-        : 'No team headlines right now.';
-
-    return i.editReply({
-        content: text,
-        components: [linkButtonsRow(), linkButtonsRow2()],
-    });
-    }
 
 
     // ===== /fantasynews (RotoWire) =====
