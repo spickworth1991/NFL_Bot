@@ -12,6 +12,14 @@ import {
 } from 'discord.js';
 import RSSParser from 'rss-parser';
 import Database from 'better-sqlite3';
+// health-server.js (add to your bot)
+import http from 'node:http';
+const port = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, {'Content-Type': 'text/plain'});
+  res.end('ok');
+}).listen(port, '0.0.0.0', () => console.log('health on', port));
+
 
 // ===== ENV =====
 const {
