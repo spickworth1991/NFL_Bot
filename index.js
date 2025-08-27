@@ -14,6 +14,8 @@ import RSSParser from 'rss-parser';
 import Database from 'better-sqlite3';
 // health-server.js (add to your bot)
 import http from 'node:http';
+import './health-server.js';
+
 const port = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, {'Content-Type': 'text/plain'});
