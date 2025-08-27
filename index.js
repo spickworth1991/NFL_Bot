@@ -13,14 +13,10 @@ import {
 import RSSParser from 'rss-parser';
 import Database from 'better-sqlite3';
 // health-server.js (add to your bot)
-import http from 'node:http';
+
 import './health-server.js';
 
-const port = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, {'Content-Type': 'text/plain'});
-  res.end('ok');
-}).listen(port, '0.0.0.0', () => console.log('health on', port));
+
 
 
 // ===== ENV =====
@@ -173,12 +169,26 @@ async function tick() {
       if (typeof f === 'string') flatFeeds.push(f);
     }
 
-    for (const url of flatFeeds) {
-      const fresh = await getFresh(url, 2);
-      for (const n of fresh) {
-        // unchanged send logic...
-      }
-    }
+   for (const url of flatFeeds) {
+        const fresh = await getFresh(url, 2);
+        for (const n of fresh) {
+            const title = (n.title || '').trim();
+            const link  = (n.link  || '').trim();
+            if (!title || !link) continue;
+
+            const src = url.includes('espn.com') ? 'ESPN'
+            : url.includes('cbssports.com') ? 'CBS'
+            : url.includes('rotowire.com') ? 'RotoWire'
+            : 'Source';
+
+            await channel.send({
+            content: `**${title}** — ${link}\n_${src}_`,
+            components: [linkButtonsRow(), linkButtonsRow2()],
+            });
+            await new Promise(r => setTimeout(r, 650));
+        }
+        }
+
   }
 }
 
@@ -281,12 +291,6 @@ client.on('interactionCreate', async (i) => {
         return;
         }
 
-    if (i.isChatInputCommand()) {
-        // defer first to beat the 3s deadline
-        await i.deferReply(); // ephemeral deprecation fix is below
-        // ... do work ...
-        return i.editReply({ content: text, components: [linkButtonsRow(), linkButtonsRow2()] });
-        }
 
 
     // ===== /nfl =====
@@ -325,7 +329,7 @@ client.on('interactionCreate', async (i) => {
     // ===== /subscribe (admin only by default; double-guard here too) =====
     if (i.commandName === 'subscribe') {
       if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-        return i.reply({ content: '⛔ Requires **Manage Server**.', ephemeral: true });
+        return i.reply({ content: '⛔ Requires **Manage Server**.', flags: MessageFlags.Ephemeral });
       }
       addSub.run(i.channelId);
       // seed channel with whatever default feeds are configured
@@ -334,17 +338,17 @@ client.on('interactionCreate', async (i) => {
       }
       return i.reply({
         content: `✅ Subscribed. Polling every ${Math.round(intervalMs/1000)}s.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral 
       });
     }
 
     // ===== /unsubscribe (admin only by default; double-guard here too) =====
     if (i.commandName === 'unsubscribe') {
       if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-        return i.reply({ content: '⛔ Requires **Manage Server**.', ephemeral: true });
+        return i.reply({ content: '⛔ Requires **Manage Server**.', flags: MessageFlags.Ephemeral });
       }
       delSub.run(i.channelId);
-      return i.reply({ content: '✅ Unsubscribed.', ephemeral: true });
+      return i.reply({ content: '✅ Unsubscribed.', flags: MessageFlags.Ephemeral });
     }
 
     // ===== /team (on-demand; not in the subscription firehose) =====
@@ -366,7 +370,7 @@ client.on('interactionCreate', async (i) => {
 
     // ===== /fantasynews (RotoWire) =====
     if (i.commandName === 'fantasynews') {
-      await i.deferReply({ ephemeral: false });
+      await i.deferReply();
       const count = Math.min(5, Math.max(1, i.options.getInteger('count') ?? 3));
       const f = await fetchFeed(FEED_MAP.rotowire);
       const items = uniqueNewest(f.items || [], count);
@@ -420,13 +424,13 @@ client.on('interactionCreate', async (i) => {
       return i.reply({
         embeds: [embed],
         components: [linkButtonsRow(), linkButtonsRow2()],
-        ephemeral: true, // only the admin who runs it sees it
+        flags: MessageFlags.Ephemeral // only the admin who runs it sees it
       });
     }
   } catch (err) {
     console.error('INTERACTION ERROR:', err);
     if (i.isRepliable()) {
-      try { await i.reply({ content: '⚠️ Something went wrong handling that command.', ephemeral: true }); } catch {}
+      try { await i.reply({ content: '⚠️ Something went wrong handling that command.', flags: MessageFlags.Ephemeral });; } catch {}
     }
   }
 });
