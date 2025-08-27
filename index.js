@@ -285,7 +285,7 @@ client.on('interactionCreate', async (i) => {
         // defer first to beat the 3s deadline
         await i.deferReply(); // ephemeral deprecation fix is below
         // ... do work ...
-        return i.editReply({ content: result, components: [linkButtonsRow(), linkButtonsRow2()] });
+        return i.editReply({ content: text, components: [linkButtonsRow(), linkButtonsRow2()] });
         }
 
 
